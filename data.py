@@ -44,7 +44,8 @@ INFO_FIELDS = [
     "targetMeanPrice", "targetHighPrice", "targetLowPrice", "targetMedianPrice",
     "numberOfAnalystOpinions", "recommendationMean", "recommendationKey",
     "shortPercentOfFloat", "shortRatio", "sharesOutstanding", "heldPercentInstitutions",
-    "currency", "exchange", "averageVolume",
+    "currency", "exchange", "averageVolume", "quoteType",
+    "earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd",
 ]
 
 

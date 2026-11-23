@@ -138,48 +138,61 @@ WEIGHTS = {
 }
 
 
-def direction(info: dict, hist: pd.DataFrame, earnings: dict, news_sent, pol_sent,
-              options: dict, val: dict) -> dict:
+def tech_signals(hist: pd.DataFrame) -> dict:
+    """Signals from price history alone: trend, momentum, RSI, MACD."""
     sig = {}
-
-    if hist is not None and len(hist) > 60:
-        last = hist.iloc[-1]
-        px = last["Close"]
-        parts = []
+    if hist is None or len(hist) <= 60:
+        return sig
+    last = hist.iloc[-1]
+    px = last["Close"]
+    parts = []
+    if pd.notna(last.get("SMA50")):
+        parts.append(1 if px > last["SMA50"] else -1)
+    if pd.notna(last.get("SMA200")):
+        parts.append(1 if px > last["SMA200"] else -1)
         if pd.notna(last.get("SMA50")):
-            parts.append(1 if px > last["SMA50"] else -1)
+            parts.append(1 if last["SMA50"] > last["SMA200"] else -1)
+    if parts:
+        txt = f"Price {'above' if px > last['SMA50'] else 'below'} 50-day"
         if pd.notna(last.get("SMA200")):
-            parts.append(1 if px > last["SMA200"] else -1)
-            if pd.notna(last.get("SMA50")):
-                parts.append(1 if last["SMA50"] > last["SMA200"] else -1)
-        if parts:
-            sig["Trend (50/200-day)"] = (sum(parts) / len(parts),
-                                         f"Price {'above' if px > last['SMA50'] else 'below'} 50-day"
-                                         + (f", {'above' if px > last['SMA200'] else 'below'} 200-day"
-                                            if pd.notna(last.get('SMA200')) else ""))
-        if len(hist) > 63:
-            r3 = px / hist["Close"].iloc[-64] - 1
-            sig["Momentum (3-month)"] = (math.tanh(r3 / 0.15), f"{r3:+.1%} over 3 months")
-        rsi = _n(last.get("RSI"))
-        if rsi is not None:
-            if rsi >= 75:
-                s = -0.6
-            elif rsi <= 25:
-                s = 0.6
-            else:
-                s = _clamp((rsi - 50) / 25, -1, 1) * 0.6
-            label = "overbought" if rsi >= 70 else "oversold" if rsi <= 30 else "neutral zone"
-            sig["RSI (14)"] = (s, f"RSI {rsi:.0f} ({label})")
-        mh = _n(last.get("MACDhist"))
-        if mh is not None and px:
-            sig["MACD"] = (math.tanh(mh / px * 200),
-                           f"Histogram {'positive' if mh > 0 else 'negative'} ({mh:+.2f})")
+            txt += f", {'above' if px > last['SMA200'] else 'below'} 200-day"
+        sig["Trend (50/200-day)"] = (sum(parts) / len(parts), txt)
+    if len(hist) > 63:
+        r3 = px / hist["Close"].iloc[-64] - 1
+        sig["Momentum (3-month)"] = (math.tanh(r3 / 0.15), f"{r3:+.1%} over 3 months")
+    rsi = _n(last.get("RSI"))
+    if rsi is not None:
+        if rsi >= 75:
+            v = -0.6
+        elif rsi <= 25:
+            v = 0.6
+        else:
+            v = _clamp((rsi - 50) / 25, -1, 1) * 0.6
+        label = "overbought" if rsi >= 70 else "oversold" if rsi <= 30 else "neutral zone"
+        sig["RSI (14)"] = (v, f"RSI {rsi:.0f} ({label})")
+    mh = _n(last.get("MACDhist"))
+    if mh is not None and px:
+        sig["MACD"] = (math.tanh(mh / px * 200),
+                       f"Histogram {'positive' if mh > 0 else 'negative'} ({mh:+.2f})")
+    return sig
 
-    rec = _n(info.get("recommendationMean"))
+
+def info_signals(info: dict, val: dict | None) -> dict:
+    """Signals from fundamentals: analyst ratings and the valuation gap."""
+    sig = {}
+    rec = _n(info.get("recommendationMean")) if info else None
     if rec:
         sig["Analyst ratings"] = (_clamp((3 - rec) / 1.5, -1, 1),
                                   f"Mean rating {rec:.2f} (1 = strong buy, 5 = sell)")
+    if val and val.get("upside") is not None:
+        sig["Valuation gap"] = (math.tanh(val["upside"] / 0.3),
+                                f"{val['upside']:+.0%} vs blended fair value")
+    return sig
 
+
+def deep_signals(earnings: dict, news_sent, pol_sent, options: dict) -> dict:
+    """Signals that need per-company calls: earnings, news, political news, options."""
+    sig = {}
     eh = earnings.get("history") if earnings else None
     if eh is not None and not eh.empty and "Surprise(%)" in eh.columns:
         s = pd.to_numeric(eh["Surprise(%)"], errors="coerce").dropna().head(4)
@@ -187,40 +200,32 @@ def direction(info: dict, hist: pd.DataFrame, earnings: dict, news_sent, pol_sen
             beats = int((s > 0).sum())
             sig["Earnings surprises"] = (math.tanh(s.mean() / 8),
                                          f"Beat {beats} of last {len(s)}; avg surprise {s.mean():+.1f}%")
-
-    if news_sent[0] is not None:
+    if news_sent and news_sent[0] is not None:
         sig["Company news"] = (_clamp(news_sent[0] * 2.2, -1, 1),
                                f"Avg headline sentiment {news_sent[0]:+.2f} across {news_sent[1]} stories")
-    if pol_sent[0] is not None:
+    if pol_sent and pol_sent[0] is not None:
         sig["Political & policy news"] = (_clamp(pol_sent[0] * 2.2, -1, 1),
                                           f"Relevance-weighted sentiment {pol_sent[0]:+.2f} "
                                           f"across {pol_sent[1]} items")
-
     pc = options.get("pc_oi") if options else None
     if pc:
-        # <0.7 bullish positioning, >1.2 bearish (contrarian extremes damped)
-        s = _clamp((0.95 - pc) / 0.5, -1, 1)
-        sig["Options positioning"] = (s, f"Put/call open interest {pc:.2f}")
+        sig["Options positioning"] = (_clamp((0.95 - pc) / 0.5, -1, 1), f"Put/call open interest {pc:.2f}")
+    return sig
 
-    if val and val.get("upside") is not None:
-        sig["Valuation gap"] = (math.tanh(val["upside"] / 0.3),
-                                f"{val['upside']:+.0%} vs blended fair value")
 
+def combine(sig: dict) -> dict:
+    """Weighted score, label and certainty from whichever signals are present."""
     if not sig:
-        return {"score": 0.0, "label": "Neutral", "certainty": 50, "signals": {}, "coverage": 0}
-
+        return {"score": 0.0, "label": "Neutral", "certainty": 50, "signals": {}, "coverage": 0,
+                "agreement": 0}
     used_w = sum(WEIGHTS[k] for k in sig)
     score = sum(WEIGHTS[k] * v[0] for k, v in sig.items()) / used_w
     coverage = used_w / sum(WEIGHTS.values())
-
-    # Agreement: share of weight pointing the same way as the total
     sign = 1 if score >= 0 else -1
     agree = sum(WEIGHTS[k] for k, v in sig.items() if v[0] * sign > 0.05) / used_w
-
     strength = min(1.0, abs(score) / 0.55)
     certainty = 50 + 45 * strength * (0.4 + 0.6 * agree) * math.sqrt(coverage)
     certainty = round(_clamp(certainty, 50, 95))
-
     if score > 0.25:
         label = "Bullish"
     elif score > 0.08:
@@ -231,12 +236,18 @@ def direction(info: dict, hist: pd.DataFrame, earnings: dict, news_sent, pol_sen
         label = "Leaning bearish"
     else:
         label = "Neutral"
-
     return {"score": score, "label": label, "certainty": certainty, "agreement": agree,
             "coverage": coverage,
             "signals": {k: {"value": v[0], "weight": WEIGHTS[k], "detail": v[1],
                             "contribution": WEIGHTS[k] * v[0] / used_w}
                         for k, v in sig.items()}}
+
+
+def direction(info: dict, hist: pd.DataFrame, earnings: dict, news_sent, pol_sent,
+              options: dict, val: dict) -> dict:
+    sig = {**tech_signals(hist), **info_signals(info, val),
+           **deep_signals(earnings, news_sent, pol_sent, options)}
+    return combine(sig)
 
 
 # --------------------------------------------------------------------------- #

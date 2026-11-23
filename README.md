@@ -1,6 +1,12 @@
 # Options Intel
 
-A live research dashboard for options trading. For every ticker on your watchlist it pulls:
+A live research dashboard for options trading, with three views:
+
+- **Market scanner**: every stock in the S&P 500 and Nasdaq-100 (about 520), plus all ~3,000 Nasdaq-listed stocks if you switch that on. Each one is scored for over/undervalued and bullish/bearish with a certainty %. You also get a sector heat map, stand-out lists (most undervalued, strongest bullish and bearish, earnings this week), filters, and sortable columns with 30+ metrics. Click any stock to run the full analysis.
+- **My watchlist**: the full analysis for your own tickers, side by side.
+- **Look up a company**: the full analysis for any US ticker.
+
+The full analysis for a company pulls:
 
 - **Prices**: candlestick chart, 20/50/200-day averages, volume, RSI
 - **Key financial metrics**: valuation multiples, margins, returns, growth, balance sheet, cash flow, short interest, analyst targets
@@ -49,6 +55,8 @@ Then open http://localhost:8501.
 | File | What it does |
 |---|---|
 | `app.py` | The dashboard (layout, charts, tabs, auto-refresh) |
+| `scanner.py` | Background scanner that works through every stock in the chosen markets |
+| `universe.py` + `universe/` | S&P 500, Nasdaq-100 and all-Nasdaq ticker lists (downloaded daily, with bundled backups) |
 | `engine.py` | Runs each ticker's analysis and caches results so refreshes don't overload the data sources |
 | `data.py` | Prices, fundamentals, earnings, options chains (Yahoo Finance) |
 | `news.py` | Company and political news (Yahoo plus Google News) and headline sentiment |
@@ -63,6 +71,10 @@ Then open http://localhost:8501.
 - **Default watchlist**: `default_watch` in `app.py`
 
 ## Good to know
+
+- **How the scanner works:** it runs in the background and is shared by everyone who opens the app. Prices for every stock refresh on your chosen timer. Fundamentals (multiples, margins, analyst targets) refresh once a day. After the app wakes up, the first full load takes about 5 minutes for S&P 500 + Nasdaq-100, and 20 to 30 minutes with all Nasdaq-listed stocks. The table fills in as data arrives.
+- **Quick scan vs full analysis:** the scanner's direction uses 6 of the 10 signals (trend, momentum, RSI, MACD, analysts, valuation). Its certainty is capped lower because less data goes in. Opening a company adds news, political news, earnings surprises and options flow. Those need about 15 calls per stock, which free data can't support for thousands of stocks at once.
+- **Sleeping:** free Streamlit apps go to sleep after a stretch with no visitors. Opening the link wakes the app up, and the scan restarts.
 
 - The data is free, so quotes can be about 15 minutes delayed and Yahoo sometimes rate-limits for a minute. Caching (2 minutes for prices, 7 to 15 minutes for news and fundamentals) keeps this rare. For real-time quotes you can later swap `data.py` to a paid feed such as Polygon, Tradier or Finnhub.
 - ETFs such as SPY have no earnings or valuation models, so they show "Not enough data" for valuation. Their direction and options data still work.

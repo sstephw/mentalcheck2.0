@@ -13,7 +13,10 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import engine
+import scanner
+import universe
 
+pd.set_option("styler.render.max_elements", 5_000_000)
 st.set_page_config(page_title="Options Intel", page_icon="◆", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -88,48 +91,272 @@ def ago(h):
     return f"{int(h/24)}d ago"
 
 
+
 # --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
 qp = st.query_params
 default_watch = qp.get("t", "NVDA,AAPL,MSFT,TSLA,AMZN,META,AMD,SPY")
+default_uni = [u for u in qp.get("u", "S&P 500|Nasdaq-100").split("|") if u in universe.UNIVERSES]
 with st.sidebar:
     st.markdown("### ◆ Options Intel")
-    watch_raw = st.text_area("Watchlist (comma-separated tickers)", default_watch, height=90)
-    symbols = [s.strip().upper() for s in watch_raw.replace("\n", ",").split(",") if s.strip()][:20]
+    uni_choice = st.multiselect("Scan these markets", list(universe.UNIVERSES), default=default_uni,
+                                help="S&P 500 + Nasdaq-100 is about 520 stocks. All Nasdaq-listed adds "
+                                     "~3,000 more; the first full load then takes 20-30 minutes.")
+    watch_raw = st.text_area("My watchlist (comma-separated)", default_watch, height=80)
+    symbols = [s.strip().upper() for s in watch_raw.replace("\n", ",").split(",") if s.strip()][:25]
     if ",".join(symbols) != qp.get("t"):
         st.query_params["t"] = ",".join(symbols)
-    refresh_min = st.select_slider("Auto-refresh every", options=[1, 2, 5, 10, 15, 30],
-                                   value=5, format_func=lambda m: f"{m} min")
-    rf = st.number_input("Risk-free rate (for DCF)", 0.0, 10.0, 4.25, 0.05,
-                         format="%.2f", help="Roughly the 10-year US Treasury yield, in %") / 100
+    if "|".join(uni_choice) != qp.get("u"):
+        st.query_params["u"] = "|".join(uni_choice)
+    refresh_min = st.select_slider("Price refresh", options=[2, 5, 10, 15, 30, 60], value=10,
+                                   format_func=lambda m: f"every {m} min")
+    rf = st.number_input("Risk-free rate % (for DCF)", 0.0, 10.0, 4.25, 0.05, format="%.2f",
+                         help="Roughly the 10-year US Treasury yield") / 100
     if st.button("Refresh now", width="stretch"):
         engine.clear_cache()
-        st.rerun()
-    st.caption("Tip: bookmark this page - your watchlist is saved in the link.")
+        st.session_state["_kick"] = True
+    st.caption("Bookmark the page: your markets and watchlist are saved in the link.")
     st.divider()
-    st.caption("Data: Yahoo Finance (prices, fundamentals, earnings, options) and Google News "
-               "(company and political news). Quotes can be delayed ~15 min. "
-               "Research tool only - not financial advice.")
+    st.caption("Data: Yahoo Finance and Google News, free and ~15 min delayed. "
+               "Research tool only, not financial advice.")
+
+
+@st.cache_resource
+def get_scanner():
+    return scanner.Scanner()
+
+
+sc = get_scanner()
+sc.configure(uni_choice, symbols, refresh_min)
+sc.start()
+if st.session_state.pop("_kick", False):
+    sc.kick()
+
+VAL_ORDER = ["Undervalued", "Fairly valued", "Overvalued", "Not enough data", "Loading"]
+DIR_ORDER = ["Bullish", "Leaning bullish", "Neutral", "Leaning bearish", "Bearish"]
+
+
+def colour_cells(v):
+    return f"color:{tone(v)};font-weight:600" if isinstance(v, str) and v not in ("Loading", "Not enough data") else ""
+
+
+def signed(v):
+    return f"color:{GREEN if v > 0 else RED if v < 0 else MUTED}" if isinstance(v, (int, float)) and pd.notna(v) else ""
+
+
+COLCFG = {
+    "Price": st.column_config.NumberColumn(format="$%.2f"),
+    "Day %": st.column_config.NumberColumn(format="%+.2f%%"),
+    "1M %": st.column_config.NumberColumn(format="%+.1f%%"),
+    "3M %": st.column_config.NumberColumn(format="%+.1f%%"),
+    "YTD %": st.column_config.NumberColumn(format="%+.1f%%"),
+    "Trend (60d)": st.column_config.LineChartColumn(width="small"),
+    "Market cap ($B)": st.column_config.NumberColumn(format="%.1f"),
+    "Fair value": st.column_config.NumberColumn(format="$%.2f"),
+    "Fair value gap %": st.column_config.NumberColumn(format="%+.0f%%"),
+    "Certainty %": st.column_config.ProgressColumn(format="%d%%", min_value=50, max_value=95, width="small"),
+    "Score": st.column_config.NumberColumn(format="%+.2f"),
+    "P/E (fwd)": st.column_config.NumberColumn(format="%.1f"),
+    "PEG": st.column_config.NumberColumn(format="%.2f"),
+    "EV/EBITDA": st.column_config.NumberColumn(format="%.1f"),
+    "Rev growth %": st.column_config.NumberColumn(format="%+.1f%%"),
+    "Net margin %": st.column_config.NumberColumn(format="%.1f%%"),
+    "ROE %": st.column_config.NumberColumn(format="%.1f%%"),
+    "Debt/Equity": st.column_config.NumberColumn(format="%.2f"),
+    "RSI": st.column_config.NumberColumn(format="%.0f"),
+    "Realised vol %": st.column_config.NumberColumn(format="%.0f%%"),
+    "52w range pos %": st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100, width="small"),
+    "Rel volume": st.column_config.NumberColumn(format="%.1fx"),
+    "Analyst target": st.column_config.NumberColumn(format="$%.2f"),
+    "Next earnings": st.column_config.DateColumn(format="MMM D"),
+    "Short % float": st.column_config.NumberColumn(format="%.1f%%"),
+    "Beta": st.column_config.NumberColumn(format="%.2f"),
+}
+
+COLSETS = {
+    "Overview": ["Ticker", "Company", "Price", "Day %", "Trend (60d)", "Valuation", "Fair value gap %",
+                 "Direction", "Certainty %", "Market cap ($B)", "Next earnings", "Sector"],
+    "Valuation": ["Ticker", "Company", "Price", "Fair value", "Fair value gap %", "Valuation",
+                  "Analyst target", "P/E (fwd)", "PEG", "EV/EBITDA", "Rev growth %", "Net margin %",
+                  "ROE %", "Debt/Equity"],
+    "Technicals": ["Ticker", "Company", "Price", "Day %", "1M %", "3M %", "YTD %", "Trend (60d)", "RSI",
+                   "52w range pos %", "Rel volume", "Realised vol %", "Beta", "Short % float",
+                   "Direction", "Certainty %"],
+    "Everything": None,
+}
+
+
+def show_table(df, key, height=560, cols=None, select=True):
+    view = df[cols] if cols else df
+    view = view.drop(columns=[c for c in ["Score", "Index"] if c in view.columns and cols is None])
+    styled = view.style
+    sub = [c for c in ["Valuation", "Direction"] if c in view.columns]
+    if sub:
+        styled = styled.map(colour_cells, subset=sub)
+    sub = [c for c in ["Day %", "Fair value gap %", "1M %", "3M %", "YTD %"] if c in view.columns]
+    if sub:
+        styled = styled.map(signed, subset=sub)
+    kw = dict(on_select="rerun", selection_mode="single-row") if select else {}
+    return st.dataframe(styled, hide_index=True, width="stretch", height=height, key=key,
+                        column_config=COLCFG, **kw)
 
 
 # --------------------------------------------------------------------------- #
-# Main board (re-runs on a timer)
+# Views (the fragment re-runs every minute to pick up the scanner's progress)
 # --------------------------------------------------------------------------- #
-@st.fragment(run_every=refresh_min * 60)
-def board():
-    if not symbols:
-        st.info("Add at least one ticker in the sidebar.")
+@st.fragment(run_every=60)
+def main():
+    prog = sc.progress()
+    head_l, head_r = st.columns([2, 3])
+    view = head_l.segmented_control("View", ["Market scanner", "My watchlist", "Look up a company"],
+                                    default="Market scanner", key="view", label_visibility="collapsed")
+    lp = prog["last_price"]
+    head_r.markdown(
+        f'<div class="small" style="text-align:right;padding-top:8px">'
+        f'{prog["priced"]:,} of {prog["total"]:,} stocks priced · fundamentals {prog["fundamentals"]:,}'
+        f' · {prog["status"]}' + (f' · last full price pass {lp:%H:%M}' if lp else "") + "</div>",
+        unsafe_allow_html=True)
+    if view == "My watchlist":
+        watchlist_view()
+    elif view == "Look up a company":
+        lookup_view()
+    else:
+        scanner_view(prog)
+
+
+def scanner_view(prog):
+    df = sc.table(rf)
+    if prog["total"] and prog["fundamentals"] < prog["total"]:
+        frac = prog["fundamentals"] / prog["total"]
+        st.progress(frac, text=f"First scan in progress: fundamentals for {prog['fundamentals']:,} of "
+                                f"{prog['total']:,} stocks. The table fills in as they load; "
+                                f"this page updates every minute.")
+    if df.empty:
+        st.info("Scanning the market... the first prices appear within a minute or two.")
         return
-    with st.spinner("Pulling prices, filings, options and news..."):
+
+    # Market pulse
+    adv, dec = int((df["Day %"] > 0).sum()), int((df["Day %"] < 0).sum())
+    bull = int(df["Direction"].isin(["Bullish", "Leaning bullish"]).sum())
+    bear = int(df["Direction"].isin(["Bearish", "Leaning bearish"]).sum())
+    under = int((df["Valuation"] == "Undervalued").sum())
+    over = int((df["Valuation"] == "Overvalued").sum())
+    c = st.columns(4)
+    c[0].markdown(kpi("Stocks scanned", f"{len(df):,}", f"median move today {df['Day %'].median():+.2f}%"),
+                  unsafe_allow_html=True)
+    c[1].markdown(kpi("Advancing / declining", f"{adv:,} / {dec:,}", "today",
+                      GREEN if adv > dec else RED), unsafe_allow_html=True)
+    c[2].markdown(kpi("Bullish / bearish", f"{bull:,} / {bear:,}", "quick-scan direction",
+                      GREEN if bull > bear else RED), unsafe_allow_html=True)
+    c[3].markdown(kpi("Undervalued / overvalued", f"{under:,} / {over:,}", "vs blended fair value"),
+                  unsafe_allow_html=True)
+
+    # Sector heat map
+    hm = df.dropna(subset=["Market cap ($B)", "Day %"])
+    hm = hm[hm["Sector"] != ""].nlargest(700, "Market cap ($B)")
+    if len(hm) > 10:
+        sec = list(hm["Sector"].unique())
+        fig = go.Figure(go.Treemap(
+            labels=list(hm["Ticker"]) + sec,
+            ids=list(hm["Ticker"]) + ["sec:" + x for x in sec],
+            parents=["sec:" + x for x in hm["Sector"]] + [""] * len(sec),
+            values=list(hm["Market cap ($B)"]) + [0] * len(sec),
+            customdata=hm[["Company", "Day %", "Direction"]].values.tolist() + [["", 0.0, ""]] * len(sec),
+            marker=dict(colors=list(hm["Day %"].clip(-3, 3)) + [0] * len(sec), cmid=0, cmin=-3, cmax=3,
+                        colorscale=[[0, RED], [0.5, "#2a303c"], [1, GREEN]]),
+            texttemplate="<b>%{label}</b><br>%{customdata[1]:+.2f}%",
+            hovertemplate="%{customdata[0]}<br>%{customdata[1]:+.2f}% · %{customdata[2]}<extra></extra>",
+            branchvalues="remainder", pathbar=dict(visible=False)))
+        fig.update_layout(height=430, margin=dict(l=0, r=0, t=26, b=0),
+                          title=dict(text="Today by sector (size = market cap, colour = % move)",
+                                     font=dict(size=14)))
+        st.plotly_chart(fig, width="stretch", key="heatmap")
+
+    # Top lists
+    st.markdown("#### Stand-outs")
+    t = st.columns(4)
+    lists = [
+        ("Most undervalued", df[df["Valuation"] == "Undervalued"].nlargest(10, "Fair value gap %"),
+         ["Ticker", "Price", "Fair value gap %"]),
+        ("Strongest bullish", df.sort_values(["Score", "Certainty %"], ascending=False).head(10),
+         ["Ticker", "Day %", "Certainty %"]),
+        ("Strongest bearish", df.sort_values(["Score", "Certainty %"], ascending=[True, False]).head(10),
+         ["Ticker", "Day %", "Certainty %"]),
+        ("Earnings in the next 7 days",
+         df[pd.to_datetime(df["Next earnings"]).between(pd.Timestamp.now().normalize(),
+                                                         pd.Timestamp.now() + pd.Timedelta(days=7))]
+         .sort_values("Next earnings").head(10), ["Ticker", "Next earnings", "Direction"]),
+    ]
+    for col, (title, d, cols) in zip(t, lists):
+        col.markdown(f"**{title}**")
+        if d.empty:
+            col.caption("None right now")
+        else:
+            with col:
+                show_table(d, key=f"top_{title}", height=36 + 35 * len(d), cols=cols, select=False)
+
+    # Filters
+    st.markdown("#### All stocks")
+    f = st.columns([2, 2, 2, 2, 1.4])
+    q = f[0].text_input("Search ticker or company", key="q", placeholder="e.g. NVDA or bank")
+    sectors = sorted(s for s in df["Sector"].unique() if s)
+    sel_sec = f[1].multiselect("Sector", sectors, key="fsec")
+    sel_val = f[2].multiselect("Valuation", [v for v in VAL_ORDER if v in set(df["Valuation"])], key="fval")
+    sel_dir = f[3].multiselect("Direction", [d for d in DIR_ORDER if d in set(df["Direction"])], key="fdir")
+    min_cert = f[4].number_input("Min certainty %", 50, 95, 50, 5, key="fcert")
+    g = st.columns([2, 2, 4])
+    min_cap = g[0].number_input("Min market cap ($B)", 0.0, 5000.0, 0.0, 1.0, key="fcap")
+    sort_by = g[1].selectbox("Sort by", ["Market cap ($B)", "Day %", "Fair value gap %", "Certainty %",
+                                         "Score", "3M %", "RSI", "Next earnings"], key="fsort")
+    colset = g[2].segmented_control("Columns", list(COLSETS), default="Overview", key="fcols")
+
+    v = df
+    if q:
+        m = v["Ticker"].str.contains(q.upper(), regex=False) | v["Company"].str.contains(q, case=False, regex=False)
+        v = v[m]
+    if sel_sec:
+        v = v[v["Sector"].isin(sel_sec)]
+    if sel_val:
+        v = v[v["Valuation"].isin(sel_val)]
+    if sel_dir:
+        v = v[v["Direction"].isin(sel_dir)]
+    if min_cert > 50:
+        v = v[v["Certainty %"] >= min_cert]
+    if min_cap > 0:
+        v = v[v["Market cap ($B)"] >= min_cap]
+    asc = sort_by in ("Next earnings",)
+    if sort_by == "Score":
+        v = v.reindex(v["Score"].abs().sort_values(ascending=False).index)
+    else:
+        v = v.sort_values(sort_by, ascending=asc, na_position="last")
+    v = v.reset_index(drop=True)
+    st.caption(f"{len(v):,} stocks · click a row to open the full analysis (news, political news, "
+               f"earnings and options). The quick scan scores direction from trend, momentum, RSI, MACD, "
+               f"analysts and valuation.")
+    ev = show_table(v, key="scan_tbl", cols=COLSETS.get(colset or "Overview"))
+    rows = ev.selection.rows if ev is not None and hasattr(ev, "selection") else []
+    sym = v.iloc[rows[0]]["Ticker"] if rows and rows[0] < len(v) else None
+    if not sym:
+        opts = ["Choose a stock..."] + [f"{t} · {c}" for t, c in zip(v["Ticker"], v["Company"])]
+        choice = st.selectbox("Open full analysis", opts, key="open_pick")
+        sym = choice.split(" · ")[0] if choice != opts[0] else None
+    if sym:
+        st.divider()
+        with st.spinner(f"Running full analysis on {sym} (news, political news, earnings, options)..."):
+            r = engine.analyze(sym, rf)
+        if r.get("ok"):
+            detail(r, ctx="scan")
+        else:
+            st.warning(f"Couldn't load {sym} right now. Try again in a minute.")
+
+
+def watchlist_view():
+    if not symbols:
+        st.info("Add tickers to your watchlist in the sidebar.")
+        return
+    with st.spinner("Running full analysis on your watchlist..."):
         res = engine.analyze_many(symbols, rf)
-
-    top_l, top_r = st.columns([3, 1])
-    top_l.markdown("## Watchlist")
-    top_r.markdown(f'<div class="small" style="text-align:right;padding-top:18px">'
-                   f'Updated {datetime.now():%b %d, %H:%M:%S} · refreshes every {refresh_min} min</div>',
-                   unsafe_allow_html=True)
-
     rows, bad = [], []
     for s in symbols:
         r = res.get(s)
@@ -139,50 +366,50 @@ def board():
         nd = r["earnings"].get("next_date")
         days = (pd.Timestamp(nd).normalize() - pd.Timestamp.now().normalize()).days if nd else None
         rows.append({
-            "Ticker": s,
-            "Company": r["info"]["name"],
-            "Price": r["info"]["price"],
-            "Day": (r["day_change"] or 0) * 100,
+            "Ticker": s, "Company": r["info"]["name"], "Price": r["info"]["price"],
+            "Day %": (r["day_change"] or 0) * 100,
             "Valuation": r["valuation"]["verdict"],
-            "Fair value gap": r["valuation"]["upside"] * 100 if r["valuation"]["upside"] is not None else float("nan"),
-            "Direction": r["direction"]["label"],
-            "Certainty": r["direction"]["certainty"],
-            "ATM IV": r["vol"]["iv"] * 100 if r["vol"]["iv"] else float("nan"),
+            "Fair value gap %": r["valuation"]["upside"] * 100 if r["valuation"]["upside"] is not None else float("nan"),
+            "Direction": r["direction"]["label"], "Certainty %": r["direction"]["certainty"],
+            "ATM IV %": r["vol"]["iv"] * 100 if r["vol"]["iv"] else float("nan"),
             "IV / HV": r["vol"]["ratio"] if r["vol"]["ratio"] else float("nan"),
-            "Next earnings": f"{nd:%b %d} ({days}d)" if nd and days is not None and days >= 0 else "—",
-            "Earnings move": r["earn_move"]["move"] * 100 if r["earn_move"] else float("nan"),
+            "Next earnings": nd if nd and days is not None and days >= 0 else None,
+            "Earnings move ±%": r["earn_move"]["move"] * 100 if r["earn_move"] else float("nan"),
         })
     if bad:
-        st.warning("No data for: " + ", ".join(bad) + ". Check the symbol, or the data source may "
-                   "be rate-limiting - it usually clears within a minute.")
+        st.warning("No data for: " + ", ".join(bad) + ". Check the symbol, or the data source may be "
+                   "rate-limiting; it usually clears within a minute.")
     if not rows:
         return
+    st.caption("Full 10-signal read (adds news, political news, earnings surprises and options flow).")
+    COLCFG.update({"ATM IV %": st.column_config.NumberColumn(format="%.0f%%"),
+                   "IV / HV": st.column_config.NumberColumn(format="%.2f"),
+                   "Earnings move ±%": st.column_config.NumberColumn(format="±%.1f%%")})
     df = pd.DataFrame(rows)
-
-    def colour(v):
-        return f"color:{tone(v)};font-weight:600"
-
-    styled = (df.style
-              .map(colour, subset=["Valuation", "Direction"])
-              .map(lambda v: f"color:{GREEN if v > 0 else RED if v < 0 else MUTED}",
-                   subset=["Day", "Fair value gap"])
-              .format({"Price": "${:,.2f}", "Day": "{:+.2f}%", "Fair value gap": "{:+.0f}%",
-                       "Certainty": "{:.0f}%", "ATM IV": "{:.0f}%", "IV / HV": "{:.2f}",
-                       "Earnings move": "±{:.1f}%"}, na_rep="—"))
-    st.dataframe(styled, hide_index=True, width="stretch",
-                 height=min(42 + 35 * len(df), 560))
-
-    st.markdown("")
+    show_table(df, key="watch_tbl", height=min(42 + 35 * len(df), 560), select=False)
     pick = st.segmented_control("Company detail", [r["Ticker"] for r in rows],
                                 default=rows[0]["Ticker"], key="pick")
     if pick:
-        detail(res[pick])
+        detail(res[pick], ctx="watch")
+
+
+def lookup_view():
+    sym = st.text_input("Any US-listed ticker", key="lookup", placeholder="e.g. PLTR").strip().upper()
+    if not sym:
+        st.caption("Type a ticker for the full analysis, even if it isn't in the scanned markets.")
+        return
+    with st.spinner(f"Analysing {sym}..."):
+        r = engine.analyze(sym, rf)
+    if r.get("ok"):
+        detail(r, ctx="look")
+    else:
+        st.warning(f"No data found for {sym}.")
 
 
 # --------------------------------------------------------------------------- #
 # Company detail
 # --------------------------------------------------------------------------- #
-def detail(r):
+def detail(r, ctx=""):
     info, val, drn, vol = r["info"], r["valuation"], r["direction"], r["vol"]
     st.markdown(f"## {info['name']} ({r['symbol']})")
     st.markdown(f'<div class="small">{info.get("sector") or ""} · {info.get("industry") or ""}'
@@ -213,27 +440,27 @@ def detail(r):
     tabs = st.tabs(["Chart", "Key metrics", "Valuation", "Signals", "Earnings", "Options",
                     f"Company news ({len(r['company_news'])})",
                     f"Political & policy ({len(r['political_news'])})", "About"])
-    with tabs[0]: chart_tab(r)
+    with tabs[0]: chart_tab(r, ctx)
     with tabs[1]: metrics_tab(info)
     with tabs[2]: valuation_tab(val)
     with tabs[3]: signals_tab(drn)
     with tabs[4]: earnings_tab(r)
-    with tabs[5]: options_tab(r)
-    with tabs[6]: news_list(r["company_news"], political=False)
-    with tabs[7]: news_list(r["political_news"], political=True)
+    with tabs[5]: options_tab(r, ctx)
+    with tabs[6]: news_list(r["company_news"], False, f"{ctx}{r['symbol']}")
+    with tabs[7]: news_list(r["political_news"], True, f"{ctx}{r['symbol']}")
     with tabs[8]:
         st.write(info.get("longBusinessSummary") or "No description available.")
         if info.get("website"):
             st.markdown(f"[{info['website']}]({info['website']})")
 
 
-def chart_tab(r):
+def chart_tab(r, ctx=""):
     h = r["hist"]
     if h is None or h.empty:
         st.info("No price history.")
         return
     span = st.segmented_control("Range", ["1M", "3M", "6M", "1Y", "2Y"], default="6M",
-                                key=f"rng_{r['symbol']}")
+                                key=f"rng_{ctx}{r['symbol']}")
     days = {"1M": 22, "3M": 66, "6M": 130, "1Y": 252, "2Y": 504}[span or "6M"]
     d = h.tail(days)
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[.62, .18, .2],
@@ -406,7 +633,7 @@ def earnings_tab(r):
         st.plotly_chart(fig, width="stretch")
 
 
-def options_tab(r):
+def options_tab(r, ctx=""):
     o = r["options"]
     ex = o.get("expiries")
     if ex is None or ex.empty:
@@ -434,7 +661,7 @@ def options_tab(r):
     show["Put/Call vol"] = show["Put/Call vol"].map(num)
     st.dataframe(show, hide_index=True, width="stretch")
 
-    exp = st.selectbox("Open interest by strike", list(o["chains"].keys()), key=f"exp_{r['symbol']}")
+    exp = st.selectbox("Open interest by strike", list(o["chains"].keys()), key=f"exp_{ctx}{r['symbol']}")
     if exp:
         calls, puts = o["chains"][exp]
         px = r["info"]["price"]
@@ -455,12 +682,12 @@ def options_tab(r):
             b.markdown("**Puts**"); b.dataframe(puts[[c for c in cols if c in puts]], hide_index=True)
 
 
-def news_list(items, political):
+def news_list(items, political, kid=""):
     if not items:
         st.info("No recent stories found.")
         return
     if political:
-        only = st.toggle("Only stories that name this company", key=f"direct_{id(items)}")
+        only = st.toggle("Only stories that name this company", key=f"direct_{kid}")
         if only:
             items = [i for i in items if i.get("direct")]
     html = []
@@ -480,4 +707,5 @@ def news_list(items, political):
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-board()
+
+main()
